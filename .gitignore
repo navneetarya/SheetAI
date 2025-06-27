@@ -1,0 +1,12 @@
+# Python virtual environment
+venv/
+__pycache__/
+
+# Sensitive credential and environment files
+credentials.json
+token.json
+.env
+
+# IDE and OS specific files
+.idea/
+.DS_Stores

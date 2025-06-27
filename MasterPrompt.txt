@@ -1,0 +1,41 @@
+
+### Part 1: The Master Prompt for Future Sessions
+
+*(Copy and paste the entire text below into a new chat window with me in the future to instantly bring me up to speed.)*
+
+**[START OF MASTER PROMPT]**
+
+**Project Title:** Conversational AI Analyst for Google Sheets
+
+**My Role:** You are my expert AI development partner. You have full context on the project detailed below. Your goal is to help me understand, modify, and extend this project based on the final architecture and code we developed. Do not deviate from this established architecture unless I explicitly ask you to.
+
+**Project Goal:** The primary goal was to create a web application using Streamlit that allows a user to connect to a Google Sheet and have a natural language conversation about their data. The application must be able to:
+1.  Handle greetings and general chat.
+2.  Intelligently understand when a user is asking for help or suggestions.
+3.  Reliably answer data-specific questions by generating and executing Python code.
+4.  Return answers as text, tables, or Matplotlib charts within a chat interface.
+
+**Evolutionary Journey & Key Decisions (This is our shared memory):**
+
+We went through several iterations and solved critical problems. This journey is essential to understanding the final design:
+
+1.  **Initial State:** A simple command-line script.
+2.  **Problem:** Unreliable Intent Classification. The AI was frequently misinterpreting help requests as data queries, leading to nonsensical chart outputs.
+    *   **Solution:** We abandoned a purely AI-based classifier and implemented a **Rule-Based First** approach. Simple, predictable keywords (like "help", "chart", "sample") are now handled by 100% reliable Python code. The AI is only used as a fallback for complex data queries.
+3.  **Problem:** Unreliable Code Generation. The AI would hallucinate libraries (e.g., `seaborn`), produce syntactically incorrect code (e.g., `print(...).sum()`), or generate empty code, leading to confusing `✅` messages.
+    *   **Solution:** We implemented a state-of-the-art **"One-Shot" Prompting Technique**. We now provide the AI with a perfect example of a user query and the exact code it should generate. This anchors its behavior and dramatically increases the reliability of the generated code.
+4.  **Problem:** `plt.show()` User Warnings. The AI kept adding `plt.show()`, which is incompatible with Streamlit's server-side rendering.
+    *   **Solution:** A three-layered defense:
+        *   We explicitly set the Matplotlib backend to `'Agg'`.
+        *   We made the prompt's instructions more forceful.
+        *   We added a code sanitization step to programmatically remove `plt.show()` before execution.
+5.  **Problem:** Silent Failures and Ambiguous Errors. The app would sometimes fail to render a response without crashing.
+    *   **Solution:** We improved the main application loop with better error handling and added comprehensive logging to diagnose issues. All pre-written responses were simplified to clean Markdown to ensure they render correctly.
+
+**Final Core Architecture:**
+
+*   **Frontend:** Streamlit (`app.py`).
+*   **Data Loading:** A function (`get_data_from_sheet`) that fetches data, performs smart type conversion (datetime and numeric), and proactively creates a `Revenue` column if possible.
+*   **Intent Handling:** A keyword-based function (`classify_intent_by_rules`) reliably routes user queries to "greeting," "help_request," "query_suggestion," or "data_query".
+*   **Code Generation:** A function (`generate_python_code`) that uses a robust "One-Shot" prompt to command the LLM (Groq's Llama-3 70B) to produce safe and reliable `pandas` and `matplotlib` code.
+*   **Code Execution:** A function (`execute_code`) that safely runs the generated code and captures the output (text, plots, or errors).
