@@ -1,291 +1,314 @@
-# ==============================================================================
-# app.py - Conversational AI Google Sheets Analyst (DEFINITIVE OVERHAUL)
-# ==============================================================================
-
 import streamlit as st
 import pandas as pd
-from dotenv import load_dotenv
 import os
 import io
+import re
+import warnings
+import json
+import inspect
 from contextlib import redirect_stdout
-import matplotlib
-
-matplotlib.use('Agg')  # Set non-interactive backend
-import matplotlib.pyplot as plt
-import logging
-import sys
-
-# --- Import Google/AI Libraries ---
+from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from groq import Groq
+import matplotlib
 
-# --- Setup Detailed Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    stream=sys.stdout)
-logger = logging.getLogger(__name__)
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import logging
+import sys
 
-# --- Page Configuration ---
-st.set_page_config(page_title="Conversational Sheets Analyst", page_icon="🤖", layout="centered")
-
-# --- Load Environment Variables ---
+# --- Basic Setup ---
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
+
+st.set_page_config(page_title="Conversational Sheet Analyst", layout="wide")
+st.title("🤖 Structure-Aware Analyst Agent")
+
+# --- Google Authentication & Data Loading (Cached) ---
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 
 
-# --- Data Loading and Preparation ---
-@st.cache_data(ttl=600)
-def get_data_from_sheet(spreadsheet_id, range_name):
-    try:
-        creds = None
-        if os.path.exists('token.json'): creds = Credentials.from_authorized_user_file('token.json',
-                                                                                       ['https://www.googleapis.com/auth/spreadsheets.readonly'])
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file('credentials.json',
-                                                                 ['https://www.googleapis.com/auth/spreadsheets.readonly'])
-                creds = flow.run_local_server(port=0, open_browser=False)
-            with open('token.json', 'w') as token:
-                token.write(creds.to_json())
-
-        service = build('sheets', 'v4', credentials=creds)
-        result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
-        values = result.get('values', [])
-        if not values: return None
-
-        df = pd.DataFrame(values[1:], columns=values[0])
-        logger.info("Performing smart data type conversion.")
-        for col in df.columns:
-            try:
-                df[col] = pd.to_datetime(df[col], errors='raise', format='mixed')
-            except (ValueError, TypeError):
-                try:
-                    df[col] = pd.to_numeric(df[col], errors='raise')
-                except (ValueError, TypeError):
-                    pass
-        if 'Units Sold' in df.columns and 'Unit Price' in df.columns:
-            if pd.api.types.is_numeric_dtype(df['Units Sold']) and pd.api.types.is_numeric_dtype(df['Unit Price']):
-                df['Revenue'] = df['Units Sold'] * df['Unit Price']
-                logger.info("Proactively created 'Revenue' column.")
-        return df
-    except Exception as e:
-        logger.error(f"Data loading/authentication failed: {e}", exc_info=True)
-        return None
-
-
-# --- AI Communication and Logic ---
-def get_ai_response(system_prompt, user_prompt, model="llama3-8b-8192"):
-    try:
-        client = Groq()
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Error communicating with AI: {e}", exc_info=True)
-        return None
-
-
-# --- FIX 1: A TRULY ROBUST, KEYWORD-BASED CLASSIFIER ---
-def classify_intent_by_rules(query):
-    query_lower = query.lower()
-    # Using dictionaries for clarity and easier expansion
-    intent_keywords = {
-        "greeting": ["hello", "hi", "hey", "how are you"],
-        "help_request": ["help", "what can you do", "options", "what charts", "what can i create"],
-        "query_suggestion": ["sample", "example", "suggestion", "what should i ask", "give me questions"]
-    }
-    for intent, keywords in intent_keywords.items():
-        if any(keyword in query_lower for keyword in keywords):
-            logger.info(f"Rule-based intent classified as: {intent}")
-            return intent
-    logger.info("No rule matched. Defaulting to data_query.")
-    return "data_query"
-
-
-# --- FIX 2: ADVANCED "ONE-SHOT" PROMPTING ---
-def generate_python_code(query, df_schema):
-    system_prompt = """You are a world-class Python data analyst bot. Your sole purpose is to write clean, executable Python code to answer a user's question about a pandas DataFrame named `df`.
-You will be penalized if you respond with anything other than pure Python code.
-You must follow these rules:
-1.  Your response MUST be ONLY Python code. No text, explanations, or markdown.
-2.  You are ONLY allowed to use `pandas` and `matplotlib.pyplot`. Do NOT import any other libraries.
-3.  For plots, you MUST use `fig, ax = plt.subplots()` and plot on the `ax` object. The figure variable must be named `fig`.
-4.  You MUST NOT include `plt.show()` in your code.
-5.  If the user asks about revenue, assume a 'Revenue' column already exists."""
-
-    user_prompt = f"""
-Here is a perfect example of how to respond.
----
-EXAMPLE
-User's question: "Create a bar chart of the total revenue per category"
-The DataFrame `df` has this schema:
-Category: object
-Revenue: float64
-
-Your response (MUST be only this code):
-fig, ax = plt.subplots()
-revenue_by_category = df.groupby('Category')['Revenue'].sum()
-revenue_by_category.plot(kind='bar', ax=ax)
-ax.set_title('Total Revenue by Category')
-ax.set_ylabel('Total Revenue')
----
-
-Now, perform this task:
-User's question: '{query}'
-The DataFrame `df` has this schema:
-{df_schema}
-
-Your response:
-"""
-    code = get_ai_response(system_prompt, user_prompt, model="llama3-70b-8192")
-    if code:
-        code = code.strip()
-        if code.startswith("```python"): code = code[9:]
-        if code.endswith("```"): code = code.strip()[:-3]
-        return code.strip()
-    return ""
-
-
-def generate_query_suggestions(df_schema, context_query):
-    system_prompt = "You are a helpful assistant who suggests data analysis questions based on a DataFrame schema. You must only respond with a Python list of strings."
-
-    # Add context if user asked about charts
-    if 'chart' in context_query.lower():
-        user_prompt = f"The user is interested in charts. Based on this DataFrame schema, create 5 insightful chart-related questions:\n{df_schema}"
-    else:
-        user_prompt = f"Based on this DataFrame schema, create 5 diverse questions (including calculations and charts):\n{df_schema}"
-
-    response_str = get_ai_response(system_prompt, user_prompt)
-    try:
-        suggestions = eval(response_str)
-        if isinstance(suggestions, list): return suggestions
-    except:
-        pass
-    return ["What is the total 'Revenue'?", "Plot a bar chart of 'Revenue' per 'Region'."]
-
-
-def is_valid_code(code_string):
-    if not code_string: return False
-    # A simple check for common pandas/matplotlib patterns. More robust than just keywords.
-    return 'df' in code_string or 'plt' in code_string
-
-
-def execute_code(code, df):
-    local_scope = {'df': df, 'pd': pd, 'plt': plt}
-    string_io = io.StringIO()
-    try:
-        with redirect_stdout(string_io):
-            exec(code, local_scope)
-        printed_output = string_io.getvalue()
-        fig = local_scope.get('fig', None)
-        if fig:
-            if hasattr(fig, 'figure'): fig = fig.figure
-            return {"type": "plot", "content": fig}
-        elif printed_output:
-            return {"type": "text", "content": f"```\n{printed_output}\n```"}
+@st.cache_resource
+def authenticate_google():
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
-            # --- FIX 3: HONEST AND CLEAR ERROR FOR NO OUTPUT ---
-            return {"type": "error",
-                    "content": "I ran the analysis, but it didn't produce a chart or a text answer. Please try rephrasing your question to be more specific."}
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0, open_browser=False)
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    return creds
+
+
+@st.cache_data(ttl=600)
+def get_sheet_names(_creds, spreadsheet_id):
+    try:
+        service = build('sheets', 'v4', credentials=_creds)
+        sheets_meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        return [sheet['properties']['title'] for sheet in sheets_meta['sheets']]
     except Exception as e:
-        logger.error(f"Code execution failed: {e}\nCode:\n{code}", exc_info=True)
-        return {"type": "error", "content": f"An error occurred: {e}\n\n**Generated Code:**\n```python\n{code}\n```"}
+        st.error(f"Error fetching sheet names: {e}")
+        return []
 
 
-# ==============================================================================
-# --- STREAMLIT UI ---
-# ==============================================================================
-st.title("🤖 Conversational Sheets Analyst")
+# DEFINITIVE FIX: New data loader with robust de-duplication
+@st.cache_data(ttl=600)
+def load_and_restructure_data(_creds, spreadsheet_id, sheet_name, header_rows_str="0,1"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            header_rows = [int(x.strip()) for x in header_rows_str.split(',')]
 
-with st.sidebar:
-    # Sidebar remains unchanged
-    st.header("🔗 Connection Details")
-    sheet_id = st.text_input("Google Sheet ID")
-    sheet_name = st.text_input("Sheet Name", "Sheet1")
-    if st.button("Connect to Sheet", type="primary"):
-        with st.spinner("Connecting..."):
-            df = get_data_from_sheet(sheet_id, sheet_name)
-            st.session_state.df = df
-            if df is not None:
-                st.success("Successfully connected!")
-                intro = {"role": "assistant", "content": {"type": "text",
-                                                          "content": "Hello! I'm ready to analyze your data. How can I help?"}}
-                st.session_state.messages = [intro]
-                st.session_state.df_schema = df.dtypes.to_string()
-            else:
-                st.error("Failed to load data.")
+            service = build('sheets', 'v4', credentials=_creds)
+            result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=sheet_name).execute()
+            values = result.get('values', [])
 
-if "df" in st.session_state and st.session_state.df is not None:
+            if not values: return None
+
+            raw_df = pd.DataFrame(values).replace('', pd.NA)
+
+            # --- Manual Header Reconstruction ---
+            top_header = raw_df.iloc[header_rows[0]].ffill()
+            bottom_header = raw_df.iloc[header_rows[1]]
+
+            final_headers = []
+            for i, (top, bottom) in enumerate(zip(top_header, bottom_header)):
+                if pd.notna(top) and pd.notna(bottom) and top != bottom:
+                    final_headers.append(f"{top}_{bottom}")
+                else:
+                    final_headers.append(bottom if pd.notna(bottom) else top)
+
+            # --- Post-Hoc De-duplication ---
+            cols = pd.Series(final_headers)
+            for dup in cols[cols.duplicated()].unique():
+                cols[cols[cols == dup].index.values.tolist()] = [f"{dup}_{i}" if i != 0 else f"{dup}" for i in
+                                                                 range(sum(cols == dup))]
+
+            raw_df.columns = cols
+
+            # --- DataFrame Creation and Cleanup ---
+            data_start_row = max(header_rows) + 1
+            df = raw_df.iloc[data_start_row:]
+
+            df = df.set_index(df.columns[0])
+            df.index.name = "End Point"
+
+            df = df.apply(pd.to_numeric, errors='coerce').convert_dtypes()
+
+            return df
+        except Exception as e:
+            st.error(f"Failed to load and restructure data. Error: {e}")
+            logging.error(f"Data restructuring failed: {e}")
+            return None
+
+
+# --- LLM & Agent Tools (All functions from here down are stable) ---
+def call_llm(system_prompt, user_prompt, model="llama3-70b-8192", json_mode=False, temperature=0.0):
+    try:
+        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        if json_mode:
+            response = client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature, response_format={"type": "json_object"}
+            )
+        else:
+            response = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"LLM Error: {e}")
+        return json.dumps({"error": f"LLM communication failed: {e}"})
+
+
+def clean_code(code):
+    if "```python" in code: code = code.split("```python", 1)[1]
+    return code.strip().strip('`')
+
+
+def list_chart_types():
+    chart_list = ["Bar Chart", "Line Plot", "Scatter Plot", "Pie Chart", "Histogram"]
+    formatted_list = "I can create the following types of charts for you:\n* " + "\n* ".join(chart_list)
+    return json.dumps({"answer": formatted_list})
+
+
+def generate_chart_code(prompt: str, schema: str):
+    system_prompt = """You are an expert Python data visualization generator. Your response must be ONLY the Python code, wrapped in a markdown block.
+STRICT RULES:
+1. The pandas DataFrame is ALWAYS named `df`. The columns have descriptive, combined names like 'BuildName_MetricName'.
+2. The code must generate a SINGLE chart. Use `fig, ax = plt.subplots()`.
+3. Set a clear title and labels. DO NOT use `plt.show()`.
+"""
+    return call_llm(system_prompt, f"User prompt: {prompt}\nDataFrame schema:\n{schema}", json_mode=False)
+
+
+def generate_data_query_code(prompt: str, schema: str):
+    system_prompt = """You are an expert Python data analyst. Your response must be ONLY the Python code, wrapped in a markdown block.
+STRICT RULES:
+1. The pandas DataFrame is ALWAYS named `df`. The columns have descriptive, combined names like 'BuildName_MetricName'.
+2. The code must PRINT the final answer as a full, human-readable sentence.
+"""
+    return call_llm(system_prompt, f"User prompt: {prompt}\nDataFrame schema:\n{schema}", json_mode=False)
+
+
+def clarify_or_answer_general(prompt: str):
+    system_prompt = """You are a helpful AI assistant. Your response must be a JSON object in the format: {"answer": "your response"}."""
+    return call_llm(system_prompt, prompt, json_mode=True)
+
+
+def execute_code_and_capture_output(code: str, df: pd.DataFrame):
+    if not code or not isinstance(code, str): return {"type": "error", "content": "No code was generated."}
+    clean = clean_code(code)
+    if not clean: return {"type": "error", "content": "The generated code was empty."}
+    logging.info(f"\n--- EXECUTING CLEANED CODE ---\n{clean}\n------------------------------")
+    local_scope = {'df': df, 'pd': pd, 'plt': plt, 'mdates': mdates}
+    buffer = io.StringIO()
+    try:
+        with redirect_stdout(buffer):
+            exec(clean, local_scope)
+        fig = local_scope.get('fig', plt.gcf())
+        if fig and len(fig.get_axes()) > 0: return {"type": "plot", "content": fig}
+        printed_output = buffer.getvalue()
+        if printed_output: return {"type": "text", "content": printed_output}
+        return {"type": "text", "content": "The code ran successfully but produced no output."}
+    except Exception as e:
+        logging.error(f"Code Execution Failed: {e}\nCode:\n{clean}")
+        return {"type": "error", "content": f"I tried to run some code, but it failed: {e}"}
+
+
+def run_conductor(prompt, chat_history, schema):
+    tools_list = """
+1.  `list_chart_types`: Use ONLY when the user asks a direct question about your chart types.
+2.  `generate_chart_code`: Use when the user asks to create a specific chart or plot.
+3.  `generate_data_query_code`: Use when the user asks for a specific number or calculation.
+4.  `clarify_or_answer_general`: Fallback for greetings, vague follow-ups, or general questions.
+"""
+    system_prompt = f"""You are a "Conductor" AI. Your only job is to select the single most appropriate tool from the provided list to handle the user's request.
+Your response MUST be a single, valid JSON object with "tool" and "parameters" keys.
+**Available Tools:**\n{tools_list}
+**RULES:**
+- For tools needing the user's prompt, the value MUST be the user's entire, original prompt.
+- For tools without parameters, "parameters" must be an empty object: {{}}.
+- You MUST choose a tool from the list. If unsure, choose 'clarify_or_answer_general'.
+"""
+    history_str = "\n".join([f"{msg['role']}: {msg.get('content', '')}" for msg in chat_history])
+    user_prompt_for_conductor = f"Chat History:\n{history_str}\n\nUser's Latest Prompt: \"{prompt}\"\n\nYour JSON decision:"
+    return call_llm(system_prompt, user_prompt_for_conductor, json_mode=True)
+
+
+TOOLS = {
+    "list_chart_types": list_chart_types,
+    "generate_chart_code": generate_chart_code,
+    "generate_data_query_code": generate_data_query_code,
+    "clarify_or_answer_general": clarify_or_answer_general,
+}
+
+
+def safe_call_tool(tool_name, params, **kwargs):
+    if tool_name not in TOOLS: raise ValueError(f"Unknown tool: {tool_name}")
+    tool_func = TOOLS[tool_name]
+    tool_spec = inspect.signature(tool_func)
+    valid_params = {}
+    for param_name in tool_spec.parameters:
+        if param_name in params:
+            valid_params[param_name] = params[param_name]
+        elif param_name in kwargs:
+            valid_params[param_name] = kwargs[param_name]
+    return tool_func(**valid_params)
+
+
+# --- Streamlit UI ---
+st.sidebar.header("🔗 Connect to Google Sheet")
+if 'creds' not in st.session_state: st.session_state.creds = authenticate_google()
+sheet_id = st.sidebar.text_input("Enter Google Sheet ID")
+if sheet_id:
+    try:
+        sheet_list = get_sheet_names(st.session_state.creds, sheet_id)
+        if sheet_list:
+            sheet_name = st.sidebar.selectbox("Select Sheet Tab", sheet_list)
+
+            header_rows_str = st.sidebar.text_input(
+                "Header Rows (e.g., 0,1)",
+                value="0,1",
+                help="Enter the row number(s) of the header, separated by commas. The first row is 0."
+            )
+
+            if st.sidebar.button("Load & Analyze Sheet"):
+                with st.spinner("Loading and restructuring data..."):
+                    df = load_and_restructure_data(st.session_state.creds, sheet_id, sheet_name, header_rows_str)
+                    if df is not None:
+                        st.session_state.df = df
+                        st.session_state.messages = []
+                        st.success("Sheet loaded! How can I help you analyze this structured data?")
+                    else:
+                        st.error("Could not load data. Check sheet format and header rows.")
+    except Exception as e:
+        st.sidebar.error(f"An error occurred: {e}")
+
+if "df" in st.session_state:
     df = st.session_state.df
+    st.write("### Structured Data Preview");
+    st.dataframe(df.head())
     if "messages" not in st.session_state: st.session_state.messages = []
-
     for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            content = msg["content"]
-            if content["type"] == "plot":
-                st.pyplot(content["content"])
-            elif content["type"] == "error":
-                st.error(content["content"])
+        with st.chat_message(msg['role']):
+            if msg.get('type') == 'plot':
+                st.pyplot(msg['content'])
             else:
-                st.markdown(content["content"])
+                st.markdown(msg.get('content', ''))
 
-    if prompt := st.chat_input("Ask about your data..."):
-        st.session_state.messages.append({"role": "user", "content": {"type": "text", "content": prompt}})
+    if user_prompt := st.chat_input("Ask about your structured data..."):
+        st.session_state.messages.append({"role": "user", "type": "text", "content": user_prompt})
         with st.chat_message("user"):
-            st.markdown(prompt)
-
+            st.markdown(user_prompt)
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                intent = classify_intent_by_rules(prompt)
-                response = {}
+                response = None
+                decision_str, result_str = "", ""
+                try:
+                    schema_buffer = io.StringIO()
+                    df.info(buf=schema_buffer)
+                    schema_info = schema_buffer.getvalue()
 
-                if intent == "greeting":
-                    response = {"type": "text", "content": "Hello there! How can I help you with your data today?"}
+                    decision_str = run_conductor(user_prompt, st.session_state.messages[-5:], schema_info)
+                    decision = json.loads(decision_str)
+                    tool_name = decision.get("tool")
+                    params = decision.get("parameters", {})
+                    logging.info(f"Conductor chose tool: {tool_name} with params: {params}")
 
-                elif intent == "help_request":
-                    # Using a clean, simple markdown string
-                    response_text = """
-Of course! I can help you in a few ways:
-- **Answer Questions:** Ask me to calculate or find things in your data (e.g., *'What is the total Revenue?'*).
-- **Create Charts:** Ask me to plot your data (e.g., *'Create a bar chart of sales by category'*).
-- **Get Ideas:** Ask me to *'give me some sample questions'* if you're not sure where to start.
-"""
-                    response = {"type": "text", "content": response_text}
+                    kwargs = {'schema': schema_info}
 
-                elif intent == "query_suggestion":
-                    suggestions = generate_query_suggestions(st.session_state.df_schema, prompt)
-                    response_text = "Certainly! Here are a few questions you could ask:\n\n" + "\n".join(
-                        [f"- *{s}*" for s in suggestions])
-                    response = {"type": "text", "content": response_text}
-
-                elif intent == "data_query":
-                    code = generate_python_code(prompt, st.session_state.df_schema)
-                    if code and is_valid_code(code):
-                        response = execute_code(code, df)
+                    if tool_name in ["generate_chart_code", "generate_data_query_code"]:
+                        code_str = safe_call_tool(tool_name, params, **kwargs)
+                        response = execute_code_and_capture_output(code_str, df)
+                    elif tool_name in ["list_chart_types", "clarify_or_answer_general"]:
+                        result_str = safe_call_tool(tool_name, params, **kwargs)
+                        response = {"type": "text", "content": json.loads(result_str).get("answer")}
                     else:
-                        logger.warning(f"AI generated invalid or no code for prompt: '{prompt}'")
-                        response = {"type": "error",
-                                    "content": "I wasn't able to generate a valid analysis for that question. Could you please try rephrasing it? For help, just ask 'what can you do?'."}
+                        response = {"type": "error", "content": f"Error: The AI chose an unknown tool '{tool_name}'."}
 
-                # Render the response
+                except json.JSONDecodeError as e:
+                    failed_str = result_str if result_str and result_str != decision_str else decision_str
+                    logging.error(f"JSON Decode Error: {e}. Raw response that failed: {failed_str}")
+                    response = {"type": "error",
+                                "content": "I had trouble processing that request. Please try rephrasing."}
+                except Exception as e:
+                    logging.error(f"An unexpected error occurred in the main loop: {e}")
+                    response = {"type": "error", "content": f"An unexpected error occurred: {e}"}
+
                 if response:
-                    try:
-                        if response["type"] == "plot":
-                            st.pyplot(response["content"])
-                        elif response["type"] == "error":
-                            st.error(response["content"])
-                        else:
-                            st.markdown(response["content"])
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-                    except Exception as e:
-                        logger.error(f"Failed to render response: {e}", exc_info=True)
-                        st.error("I encountered an issue displaying the response. Please check the logs.")
-                else:
-                    st.error("Sorry, I couldn't process that request.")
+                    if response.get('type') == 'plot':
+                        st.pyplot(response['content'])
+                    elif response.get('type') == 'text':
+                        st.markdown(response.get('content', ''))
+                    elif response.get('type') == 'error':
+                        st.error(response.get('content', ''))
+                    st.session_state.messages.append({"role": "assistant", **response})
 else:
-    st.info("👋 Welcome! Please enter your Google Sheet details in the sidebar to get started.")
+    st.info("Please enter a Google Sheet ID in the sidebar to begin.")
